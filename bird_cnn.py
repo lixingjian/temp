@@ -1,6 +1,7 @@
 #coding=utf8
 import numpy as np
 import os
+import sys
 from keras.preprocessing.image import ImageDataGenerator
 from keras.applications.inception_v3 import InceptionV3,preprocess_input
 from keras.layers import GlobalAveragePooling2D,Dense
@@ -9,9 +10,11 @@ from keras import optimizers
 from keras.optimizers import Adagrad, Adam
 from keras.metrics import top_k_categorical_accuracy
 
-DATA_NAME = 'bird_all'
-NUM_CLASSES = 521
+DATA_NAME = 'homestyle'
+NUM_CLASSES = 13
 BATCH_SIZE = 128
+outdir = sys.argv[1]
+os.mkdir(outdir)
 
 # 数据准备
 train_datagen = ImageDataGenerator()
@@ -68,16 +71,26 @@ def setup_to_fine_tune(model,base_model):
 
 setup_to_fine_tune(model,base_model)
 history_ft = model.fit_generator(generator=train_generator,
-                                 steps_per_epoch=2,#train_steps,
-                                 epochs=2,
+                                 steps_per_epoch=1,#train_steps,
+                                 epochs=1,#0, 
                                  validation_data=val_generator,
-                                 validation_steps=2,#valid_steps,
+                                 validation_steps=1,#valid_steps,
                                  class_weight='auto')
 
-for i in range(3, 8):
-    mid_layer = Model(inputs=model.input, outputs=model.get_layer('mixed%d' % i).output)
-    out = mid_layer.predict_generator(train_generator, train_steps/100)
-    print('midx%d' % i)
-    print(out.shape)
-    np.save('mixed%d.npy' % i, out)
-    break
+def out_mix_i(i):
+    #mid_layer = Model(inputs=model.input, outputs=model.get_layer('mixed%d' % i).output)
+    mid_layer = Model(inputs=model.input, outputs=model.layers[i].output)
+    n = 0
+    for xb, yb in train_generator:
+        if n >= train_steps:
+            break
+        n += 1
+        out = mid_layer.predict(xb)
+        print(xb.shape)
+        print(out.shape)
+        np.save('%s/mixed.%d.%d.npy' % (outdir, i, n), out)
+        np.save('%s/label.%d.%d.npy' % (outdir, i, n), yb)
+out_mix_i(310)
+out_mix_i(311)
+out_mix_i(312)
+out_mix_i(313)
