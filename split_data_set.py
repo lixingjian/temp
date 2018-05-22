@@ -8,6 +8,8 @@ def read_all(dirname):
         class_dir = dirname + '/' + label
         for image in os.listdir(class_dir):
             image_path = class_dir + '/' + image
+            if os.path.getsize(image_path) < 10:
+                continue
             data.append((image_path, label))
     return data, labels
 
