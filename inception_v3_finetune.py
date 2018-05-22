@@ -1,21 +1,24 @@
 #coding=utf8
 import numpy as np
+import sys
 import os
 from keras.preprocessing.image import ImageDataGenerator
 from keras.applications.inception_v3 import InceptionV3,preprocess_input
 from keras.layers import GlobalAveragePooling2D,Dense
-from keras.models import Model
+from keras.models import load_model, Model
 from keras import optimizers
 from keras.optimizers import Adagrad, Adam
 from keras.metrics import top_k_categorical_accuracy
 
 DATA_NAME = sys.argv[1]
 feature_dir = sys.argv[2]
-data_dir = '/home/work/lixingjian/data/custom_data'
+data_dir = '/home/work/data/custom_data'
 train_dir = '%s/%s.split/train' % (data_dir, DATA_NAME)
 valid_dir = '%s/%s.split/valid' % (data_dir, DATA_NAME)
-NUM_CLASSES = int(os.popen('ls train_dir |wc -l'))
-BATCH_SIZE = 128
+NUM_CLASSES = int(os.popen('ls %s |wc -l' % train_dir).read())
+BATCH_SIZE = 64
+
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 
 # 数据准备
 train_datagen = ImageDataGenerator()
@@ -32,7 +35,9 @@ valid_steps = int(os.popen('find %s -name "*.jpg" |wc -l' % valid_dir).read()) /
 print('train steps: %d, valid steps: %d' % (train_steps, valid_steps))
 
 # 构建基础模型
-base_model = InceptionV3(weights='imagenet',include_top=False)
+#base_model = InceptionV3(weights='imagenet',include_top=False)
+base_model = InceptionV3(weights='./inception_v3_weights_tf_dim_ordering_tf_kernels_notop.h5', include_top=False)
+#base_model = load_model('/home/work/yaoshengyun/inception_v3/inception_v3_weights_tf_dim_ordering_tf_kernels_notop1.h5')
 
 # 增加新的输出层
 x = base_model.output
