@@ -1,0 +1,418 @@
+# -*- coding: utf-8 -*-
+from __future__ import print_function, division
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torchvision import datasets, models, transforms
+import torch.utils.model_zoo as model_zoo
+import time
+import sys
+import random
+import os
+import copy
+import argparse
+import math
+import pickle
+import numpy as np
+#from scikits.learn.gmm import GMM
+from torchnet import meter
+from PIL import ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+parser = argparse.ArgumentParser(description = 'finetuning')
+parser.add_argument('--data_dir')
+parser.add_argument('--mode', default = 'train')
+parser.add_argument('--base_model', default = 'resnet101')
+parser.add_argument('--save_model', default = '')
+parser.add_argument('--image_size', type = int, default = 224)
+parser.add_argument('--lr_init', type = float, default = 0.01)
+parser.add_argument('--alpha', type = float, default = 0.01)
+parser.add_argument('--reg_type', choices = ['l2', 'l2_sp', 'gmm', 'fea_map', 'fea_map_w', 'l2_sp_w', 'fea_vec'], default = 'l2')
+#data augmentation
+parser.add_argument('--data_aug', default = 'fcn')
+
+parser.add_argument('--att_lr', type = float, default = 0.001)
+parser.add_argument('--att_wd', type = float, default = 0.0001)
+parser.add_argument('--att_ds', type = float, default = 6000)
+parser.add_argument('--att_active', default = 'relu')
+parser.add_argument('--att_fea', type = int, default = 128)
+args = parser.parse_args()
+print(args)
+
+alpha = args.alpha
+beta = 0.01
+batch_size = 64
+image_size = args.image_size
+crop_size = {224: 256}
+resize = crop_size[image_size] if 'c' in args.data_aug else image_size
+hflip = transforms.RandomHorizontalFlip()
+rcrop = transforms.RandomCrop((image_size, image_size))
+ccrop = transforms.CenterCrop((image_size, image_size))
+#cnorm = transforms.Normalize([0.5, 0.5, 0.5], [1, 1, 1])
+cnorm = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+
+def transform_compose_train():
+    if args.data_aug == 'best':
+        r = [transforms.Resize(256), hflip, transforms.CenterCrop((256, 256)), rcrop, transforms.ToTensor(), cnorm]
+    else:
+        r = [transforms.Resize((resize, resize))]
+        if 'f' in args.data_aug:
+            r.append(hflip)
+        if 'c' in args.data_aug:
+            r.append(rcrop)
+        r.append(transforms.ToTensor())
+        if 'n' in args.data_aug:
+            r.append(cnorm)
+    return transforms.Compose(r)
+
+def transform_compose_test():
+    if args.data_aug == 'best':
+        r = [transforms.Resize(256)]
+        r.append(transforms.TenCrop(224))
+        r.append(transforms.Lambda(lambda crops: torch.stack([cnorm(transforms.ToTensor()(crop)) for crop in crops])))
+    else:
+        r = [transforms.Resize((image_size, image_size))]
+        if 'c' in args.data_aug:
+            r.append(ccrop)
+        r.append(transforms.ToTensor())
+        if 'n' in args.data_aug:
+            r.append(cnorm)
+    return transforms.Compose(r)
+
+data_transforms = {'train': transform_compose_train(), 'valid': transform_compose_test()}
+set_names = list(data_transforms.keys())
+image_datasets = {x: datasets.ImageFolder(os.path.join(args.data_dir, x),
+                                          data_transforms[x])
+                  for x in set_names}
+dataloaders = {x: torch.utils.data.DataLoader(image_datasets[x], batch_size=batch_size,
+                                             shuffle=True, num_workers=4)
+              for x in set_names}
+dataset_sizes = {x: len(image_datasets[x]) for x in set_names}
+class_names = image_datasets['train'].classes
+num_classes = len(class_names)
+device = torch.device("cuda:0")
+
+def get_base_model(base_name):
+    if base_name == 'resnet50':
+        model_fea = models.resnet50(pretrained = False, num_classes = 365)
+        state_dict = torch.load('resnet50_places365_python36.pth.tar', pickle_module=pickle)['state_dict'] 
+        state_dict_new = {}
+        for k, v in state_dict.items():
+            state_dict_new[k[len('module.'):]] = v
+        model_fea.load_state_dict(state_dict_new)
+    elif base_name == 'resnet101':
+        model_fea = models.resnet101(pretrained = True)
+    return model_fea
+
+model_source = get_base_model(args.base_model)
+for param in model_source.parameters():
+    param.requires_grad = False
+model_source.to(device)
+model_source.eval()
+
+model_target = get_base_model(args.base_model)
+model_target.fc = nn.Linear(2048, num_classes)
+model_target = model_target.to(device)
+
+layer_outputs_source = []
+layer_outputs_target = []
+
+def for_hook_source(module, input, output):
+    layer_outputs_source.append(output)   
+def for_hook_target(module, input, output): 
+    layer_outputs_target.append(output)
+
+hook_layers = ['layer1.2.conv3', 'layer2.3.conv3', 'layer3.22.conv3', 'layer4.2.conv3']
+if args.base_model == 'resnet50':
+    hook_layers[2] = 'layer3.5.conv3' 
+
+def register_hook(model, func):
+    for name, layer in model.named_modules():
+        if name in hook_layers:
+            layer.register_forward_hook(func)
+
+if args.mode == 'train':
+    register_hook(model_source, for_hook_source)
+    register_hook(model_target, for_hook_target)
+
+def classifier_l2(model):
+    l2_cls = torch.tensor(0.).to(device)
+    for name, param in model.named_parameters():
+        if name.startswith('fc.'):
+            l2_cls += torch.norm(param) ** 2
+    return l2_cls
+
+def get_param_values(model):
+    feature_params = {}
+    for name, param in model.named_parameters():
+        feature_params[name] = param.clone().detach() 
+    return feature_params
+
+def param_l2_sp(model, param_dict):
+    fea_loss = torch.tensor(0.).to(device)
+    for name, param in model.named_parameters():
+        if not name.startswith('fc.'):
+            fea_loss += torch.norm(param - param_dict[name]) ** 2
+    return fea_loss
+
+def get_attention_model(param, attmodels):
+    _, channel_in, kernel_size, _ = param.shape
+    for m, _, _ in attmodels:
+        #print(channel_in, kernel_size, m.conf[1], m.conf[0])
+        if channel_in == m.conf[1] and kernel_size == m.conf[0]:
+            return m
+    return None    
+
+def param_l2_sp_attention(model, param_dict, attmodels):
+    fea_loss = torch.tensor(0.).to(device)
+    for name, param in model.named_parameters():
+        if 'conv' in name and 'weight' in name:
+            attm = get_attention_model(param, attmodels)
+            w = attm(param.detach())
+            loss = torch.reshape(param - param_dict[name], (param.shape[0], param.shape[1] * param.shape[2] * param.shape[3]))
+            loss = torch.norm(loss, 2, 1) ** 2
+            fea_loss += torch.sum(w * loss)
+    return fea_loss
+
+def feature_map_l2_sp(inputs):
+    _ = model_source(inputs)
+    fea_loss = torch.tensor(0.).to(device)
+    for fm_src, fm_tgt in zip(layer_outputs_source, layer_outputs_target):
+        fm_src = fm_src.detach()
+        #div_norm = fm_src.shape[2] * fm_src.shape[3]
+        #fea_loss += torch.norm(fm_tgt - fm_src) ** 2 / div_norm
+        div_norm = torch.norm(fm_src)
+        fea_loss += (torch.norm(fm_tgt - fm_src) / torch.norm(fm_src)) ** 2
+    return fea_loss
+
+def feature_vec_l2_sp(inputs):
+    _ = model_source(inputs)
+    fea_loss = torch.tensor(0.).to(device)
+    for fm_src, fm_tgt in zip(layer_outputs_source, layer_outputs_target):
+        fm_src = fm_src.detach()
+        b, c, h, w = fm_src.shape
+        fm_src = torch.reshape(fm_src, (b * c, 1, h * w))
+        fm_tgt = torch.reshape(fm_tgt, (b * c, h * w, 1))
+        fm_dot = torch.bmm(fm_src, fm_tgt)
+        fm_dot = fm_dot.squeeze()
+        fm_tgt = torch.norm(fm_tgt, 2, 1).squeeze()
+        loss = (1 - fm_dot / fm_tgt) / (h * w)
+        fea_loss += torch.sum(loss)
+    return fea_loss
+
+def flatten_outputs(fea):
+    return torch.reshape(fea, (fea.shape[0], fea.shape[1], fea.shape[2] * fea.shape[3]))
+
+def attentioned_feature_map_l2_sp(inputs, attmodels):
+    _ = model_source(inputs)
+    fea_loss = torch.tensor(0.).to(device)
+    for (m, _, _), fm_src, fm_tgt in zip(attmodels, layer_outputs_source, layer_outputs_target):
+        fm_src = fm_src.detach()
+        weights = m(fm_src)
+        fm_src = flatten_outputs(fm_src)
+        fm_tgt = flatten_outputs(fm_tgt)
+        div_norm = torch.mean(torch.norm(fm_src, 2, 2))
+        loss = torch.norm(fm_tgt - fm_src, 2, 2) / div_norm
+        loss = torch.mul(weights, loss ** 2)
+        fea_loss += torch.sum(loss)
+    return fea_loss
+
+if args.reg_type == 'fea_map_w':
+    class AttentionMap(nn.Module):
+        def __init__(self, input_size, channels):
+            super(AttentionMap, self).__init__()
+            fea_size = input_size if args.att_fea == 0 else args.att_fea
+            self.fc1 = nn.Linear(input_size * input_size, fea_size)
+            self.fc2 = nn.Linear(fea_size, 1)
+            self.bn = nn.BatchNorm2d(channels)
+            self.active = nn.ReLU() if args.att_active == 'relu' else nn.Tanh()
+
+        def forward(self, x):
+            x = self.bn(x)
+            x = x.reshape((x.shape[0], x.shape[1], x.shape[2] * x.shape[3]))
+            x = F.dropout(x)
+            x = self.fc1(x)
+            x = self.active(x)
+            x = self.fc2(x)
+            x = x.squeeze(2)
+            x = F.softmax(x, dim = 1)
+            return x
+elif args.reg_type == 'l2_sp_w':
+    class AttentionMap(nn.Module):
+        def __init__(self, input_size, channels):
+            super(AttentionMap, self).__init__()
+            fea_size = args.att_fea
+            self.fc1 = nn.Linear(channels * input_size * input_size, fea_size)
+            self.fc2 = nn.Linear(fea_size, 1)
+            self.active = nn.ReLU() if args.att_active == 'relu' else nn.Tanh()
+            self.conf = (input_size, channels)
+
+        def forward(self, x):
+            x = x.view((x.shape[0], -1))
+            x = F.dropout(x)
+            x = self.fc1(x)
+            x = self.active(x)
+            x = self.fc2(x)
+            x = F.sigmoid(x)
+            return x
+
+attention_models = []
+if args.reg_type == 'fea_map_w':
+    for fea_size, channels in [(56, 256), (28, 512), (14, 1024), (7, 2048)]:
+        model = AttentionMap(fea_size, channels)
+        model = model.to(device)
+        optimizer = optim.SGD(model.parameters(), lr = args.att_lr, momentum = 0.9, weight_decay = args.att_wd)
+        decay_epochs = int(args.att_ds * batch_size / dataset_sizes['train']) + 1
+        decay_lr_scheduler = optim.lr_scheduler.StepLR(optimizer, step_size = decay_epochs, gamma = 0.1)
+        attention_models.append((model, optimizer, decay_lr_scheduler))
+elif args.reg_type == 'l2_sp_w':
+    created_models = set([])
+    for name, module in model_source.named_modules():
+        if not 'conv' in name:
+            continue
+        for pn, param in module.named_parameters():
+            if not pn == 'weight':
+                continue
+            #print(pn, str(param.shape)) 
+            _, channel_in, kernel_size, _ = param.shape
+            mkey = '%d %d' % (kernel_size, channel_in)
+            if mkey in created_models:
+                continue
+            created_models.add(mkey)
+            model = AttentionMap(kernel_size, channel_in)
+            model = model.to(device)
+            optimizer = optim.SGD(model.parameters(), lr = args.att_lr, momentum = 0.9, weight_decay = args.att_wd)
+            decay_epochs = int(args.att_ds * batch_size / dataset_sizes['train']) + 1
+            decay_lr_scheduler = optim.lr_scheduler.StepLR(optimizer, step_size = decay_epochs, gamma = 0.1)
+            attention_models.append((model, optimizer, decay_lr_scheduler)) 
+
+confusion_matrix = meter.ConfusionMeter(num_classes)
+def train_model(model, attmodels, criterion, optimizer, scheduler, num_epochs):
+    since = time.time()
+    for epoch in range(num_epochs):
+        print('Epoch {}/{}'.format(epoch, num_epochs - 1))
+        print('-' * 10)
+        confusion_matrix.reset()
+        # Each epoch has a training and validation phase
+        for phase in ['train', 'valid']:
+            if phase == 'train':
+                scheduler.step()
+                model.train()  # Set model to training mode
+                for m, _, lrsh in attmodels:
+                    lrsh.step() 
+                    m.train()
+            else:
+                model.eval()   # Set model to evaluate mode
+                for m, _, _ in attmodels:
+                    m.eval()
+
+            running_loss = 0.0
+            running_corrects = 0
+
+            # Iterate over data.
+            nstep = len(dataloaders[phase])
+            for i, (inputs, labels) in enumerate(dataloaders[phase]):
+                inputs = inputs.to(device)
+                labels = labels.to(device)
+                if args.data_aug == 'best' and phase == 'valid':
+                    bs, ncrops, c, h, w = inputs.size()
+                    inputs = inputs.view(-1, c, h, w)
+                # zero the parameter gradients
+                optimizer.zero_grad()
+                for _, optm, _ in attmodels:
+                    optm.zero_grad()
+                # forward
+                # track history if only in train
+                with torch.set_grad_enabled(phase == 'train'):
+                    outputs = model(inputs)
+                    if args.data_aug == 'best' and phase == 'valid':
+                        outputs = outputs.view(bs, ncrops, -1).mean(1)
+                    loss_main = criterion(outputs, labels)
+
+                if phase == 'train':
+                    loss_classifier = 0
+                    loss_feature = 0
+                    if args.reg_type != 'l2':
+                        loss_classifier = classifier_l2(model)
+ 
+                    if args.reg_type == 'l2_sp':
+                        source_params = get_param_values(model_source)
+                        loss_feature = param_l2_sp(model, source_params)
+                    elif args.reg_type == 'l2_sp_w':
+                        source_params = get_param_values(model_source)
+                        loss_feature = param_l2_sp_attention(model, source_params, attmodels)
+                    elif args.reg_type == 'fea_map':
+                        loss_feature = feature_map_l2_sp(inputs)
+                    elif args.reg_type == 'fea_vec':
+                        loss_feature = feature_vec_l2_sp(inputs)
+                    elif args.reg_type == 'fea_map_w':
+                        loss_feature = attentioned_feature_map_l2_sp(inputs, attmodels)
+                    loss = loss_main + 0.5 * alpha * loss_feature + 0.5 * beta * loss_classifier
+ 
+                _, preds = torch.max(outputs, 1)
+                confusion_matrix.add(preds.data, labels.data)
+                if phase == 'train' and  i % 10 == 0:
+                    corr_sum = torch.sum(preds == labels.data)
+                    step_acc = corr_sum.double() / len(labels)
+                    print('step: %d/%d, loss = %.4f(%.4f, %.4f, %.4f), top1 = %.4f' %(i, nstep, loss, loss_main, 0.5 * alpha * loss_feature, 0.5 * beta * loss_classifier, step_acc))
+
+                # backward + optimize only if in training phase
+                if phase == 'train':
+                    loss.backward()
+                    optimizer.step()
+                    for _, optm, _ in attmodels:
+                        optm.step()
+                # statistics
+                running_loss += loss.item() * inputs.size(0)
+                running_corrects += torch.sum(preds == labels.data)
+                    
+                layer_outputs_source.clear()
+                layer_outputs_target.clear()
+
+            epoch_loss = running_loss / dataset_sizes[phase]
+            epoch_acc = running_corrects.double() / dataset_sizes[phase]
+
+            print('{} epoch: {:d} Loss: {:.4f} Acc: {:.4f}'.format(
+                phase, epoch, epoch_loss, epoch_acc))
+            time_elapsed = time.time() - since
+            print('Training complete in {:.0f}m {:.0f}s'.format(
+                time_elapsed // 60, time_elapsed % 60))
+            if epoch == num_epochs - 1:
+                print('{} epoch: last Loss: {:.4f} Acc: {:.4f}'.format(
+                    phase, epoch_loss, epoch_acc))
+
+            print(confusion_matrix.value())
+            # deep copy the model
+        print()
+        #torch.save(model_target.state_dict(), './model.cub.%d' % epoch)
+
+    time_elapsed = time.time() - since
+    print('Training complete in {:.0f}m {:.0f}s'.format(
+        time_elapsed // 60, time_elapsed % 60))
+    # load best model weights
+    return model
+       
+if args.reg_type == 'l2':
+    optimizer_ft = optim.SGD(filter(lambda p: p.requires_grad, model_target.parameters()),
+                        lr=args.lr_init, momentum=0.9, weight_decay = 1e-4)
+else:
+    optimizer_ft = optim.SGD(filter(lambda p: p.requires_grad, model_target.parameters()),
+                        lr=args.lr_init, momentum=0.9)
+
+num_epochs = int(9000 * batch_size / dataset_sizes['train']) 
+if num_epochs < 30:
+    num_epochs = 30
+decay_epochs = int(6000 * batch_size / dataset_sizes['train']) + 1
+print('StepLR step_size = %d' % decay_epochs)
+step_lr_decay = optim.lr_scheduler.StepLR(optimizer_ft, step_size=decay_epochs, gamma=0.1) # Decay LR by a factor of 0.1 every 7 epochs
+
+criterion = nn.CrossEntropyLoss()
+if args.mode == 'train':
+    train_model(model_target, attention_models, criterion, optimizer_ft, step_lr_decay,
+                       num_epochs = num_epochs)
+    if args.save_model != '':
+        torch.save(model_target, args.save_model)
+    sys.exit(0)
+Namespace(alpha=0.01, att_active='relu', att_ds=6000, att_fea=128, att_lr=0.001, att_wd=0.0001, base_model='resnet101', data_aug='best', data_dir='/mnt/data/lixingjian/benchmark/Caltech60.3', image_size=224, lr_init=0.005, mode='train', reg_type='fea_vec', save_model='')
